@@ -55,9 +55,10 @@ func (w *worker) run() {
 	for {
 		t := w.reqTask()
 		if !t.Alive {
-			DPrintf("worker get task not alive, exit")
+			DPrintf("worker %v get task not alive, exit", w.id)
 			return
 		}
+		DPrintf("worker %v get task alive", w.id)
 		w.doTask(t)
 	}
 }

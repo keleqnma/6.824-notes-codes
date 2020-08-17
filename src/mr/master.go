@@ -10,12 +10,14 @@ import (
 	"time"
 )
 
+type TaskStatus int
+
 const (
-	TaskStatusReady   = 0
-	TaskStatusQueue   = 1
-	TaskStatusRunning = 2
-	TaskStatusFinish  = 3
-	TaskStatusErr     = 4
+	TaskStatusReady TaskStatus = iota
+	TaskStatusQueue
+	TaskStatusRunning
+	TaskStatusFinish
+	TaskStatusErr
 )
 
 const (
@@ -24,13 +26,13 @@ const (
 )
 
 type TaskStat struct {
-	Status    int
+	Status    TaskStatus
 	WorkerId  int
+	mu        sync.Mutex
 	StartTime time.Time
 }
 
 type Master struct {
-	// Your definitions here.
 	files     []string
 	nReduce   int
 	taskPhase TaskPhase
@@ -39,6 +41,7 @@ type Master struct {
 	done      bool
 	workerSeq int
 	taskCh    chan Task
+	statCh    chan bool
 }
 
 func (m *Master) getTask(taskSeq int) Task {
@@ -57,60 +60,63 @@ func (m *Master) getTask(taskSeq int) Task {
 	return task
 }
 
-func (m *Master) schedule() {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	if m.done {
+func (m *Master) taskSchedule(taskSeq int) {
+	if m.Done() {
 		return
 	}
-	allFinish := true
-	for index, t := range m.taskStats {
-		switch t.Status {
-		case TaskStatusReady:
-			allFinish = false
-			m.taskCh <- m.getTask(index)
-			m.taskStats[index].Status = TaskStatusQueue
-		case TaskStatusQueue:
-			allFinish = false
-		case TaskStatusRunning:
-			allFinish = false
-			if time.Now().Sub(t.StartTime) > MaxTaskRunTime {
-				m.taskStats[index].Status = TaskStatusQueue
-				m.taskCh <- m.getTask(index)
-			}
-		case TaskStatusFinish:
-		case TaskStatusErr:
-			allFinish = false
-			m.taskStats[index].Status = TaskStatusQueue
-			m.taskCh <- m.getTask(index)
-		default:
-			panic("t.status err")
+	m.taskStats[taskSeq].mu.Lock()
+	DPrintf("begin,task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
+	switch m.taskStats[taskSeq].Status {
+	case TaskStatusReady:
+		m.statCh <- false
+		m.taskCh <- m.getTask(taskSeq)
+		m.taskStats[taskSeq].Status = TaskStatusQueue
+	case TaskStatusQueue:
+		m.statCh <- false
+	case TaskStatusRunning:
+		m.statCh <- false
+		if time.Now().Sub(m.taskStats[taskSeq].StartTime) > MaxTaskRunTime {
+			m.taskStats[taskSeq].Status = TaskStatusQueue
+			m.taskCh <- m.getTask(taskSeq)
 		}
+	case TaskStatusFinish:
+		m.statCh <- true
+	case TaskStatusErr:
+		m.statCh <- false
+		m.taskStats[taskSeq].Status = TaskStatusQueue
+		m.taskCh <- m.getTask(taskSeq)
+	default:
+		m.statCh <- false
+		panic("t.status err")
 	}
-	if allFinish {
-		if m.taskPhase == MapPhase {
-			m.initReduceTask()
-		} else {
-			m.done = true
-		}
-	}
+	// DPrintf("end,task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
+	defer m.taskStats[taskSeq].mu.Unlock()
 }
 
 func (m *Master) initMapTask() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.taskPhase = MapPhase
 	m.taskStats = make([]TaskStat, len(m.files))
+	for index := range m.taskStats {
+		m.taskStats[index].mu = sync.Mutex{}
+	}
 }
 
 func (m *Master) initReduceTask() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	DPrintf("init ReduceTask")
 	m.taskPhase = ReducePhase
 	m.taskStats = make([]TaskStat, m.nReduce)
+	for index := range m.taskStats {
+		m.taskStats[index].mu = sync.Mutex{}
+	}
 }
 
 func (m *Master) regTask(args *TaskArgs, task *Task) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.taskStats[task.Seq].mu.Lock()
+	defer m.taskStats[task.Seq].mu.Unlock()
 
 	if task.Phase != m.taskPhase {
 		panic("req Task phase neq")
@@ -121,7 +127,6 @@ func (m *Master) regTask(args *TaskArgs, task *Task) {
 	m.taskStats[task.Seq].StartTime = time.Now()
 }
 
-// Your code here -- RPC handlers for the worker to call.
 func (m *Master) GetOneTask(args *TaskArgs, reply *TaskReply) error {
 	task := <-m.taskCh
 	reply.Task = &task
@@ -134,8 +139,8 @@ func (m *Master) GetOneTask(args *TaskArgs, reply *TaskReply) error {
 }
 
 func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.taskStats[args.Seq].mu.Lock()
+	defer m.taskStats[args.Seq].mu.Unlock()
 
 	DPrintf("get report task: %+v, taskPhase: %+v", args, m.taskPhase)
 
@@ -149,14 +154,15 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 		m.taskStats[args.Seq].Status = TaskStatusErr
 	}
 
-	go m.schedule()
+	// go m.schedule()
+	go m.tickSingleTimer()
 	return nil
 }
 
 func (m *Master) RegWorker(args *RegisterArgs, reply *RegisterReply) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.workerSeq += 1
+	m.workerSeq++
 	reply.WorkerId = m.workerSeq
 	return nil
 }
@@ -188,10 +194,30 @@ func (m *Master) Done() bool {
 }
 
 func (m *Master) tickSchedule() {
-	// 按说应该是每个 task 一个 timer，此处简单处理
 	for !m.Done() {
-		go m.schedule()
+		m.tickSingleTimer()
 		time.Sleep(ScheduleInterval)
+	}
+}
+
+func (m *Master) tickSingleTimer() {
+	allFinish := true
+	for index := range m.taskStats {
+		go m.taskSchedule(index)
+	}
+	for range m.taskStats {
+		finStat := <-m.statCh
+		allFinish = allFinish && finStat
+	}
+	if allFinish {
+		if m.taskPhase == MapPhase {
+			log.Println("map done")
+			m.initReduceTask()
+		} else {
+			m.mu.Lock()
+			m.done = true
+			m.mu.Unlock()
+		}
 	}
 }
 
@@ -205,14 +231,15 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.files = files
 	if nReduce > len(files) {
 		m.taskCh = make(chan Task, nReduce)
+		m.statCh = make(chan bool, nReduce)
 	} else {
 		m.taskCh = make(chan Task, len(m.files))
+		m.statCh = make(chan bool, len(m.files))
 	}
 
 	m.initMapTask()
 	go m.tickSchedule()
 	m.server()
 	DPrintf("master init")
-	// Your code here.
 	return &m
 }
