@@ -26,22 +26,22 @@ const (
 )
 
 type TaskStat struct {
-	Status    TaskStatus
-	WorkerId  int
-	mu        sync.Mutex
-	StartTime time.Time
+	Status    TaskStatus //task状态
+	WorkerId  int        //处理该task的worker序号
+	mu        sync.Mutex //分段锁
+	StartTime time.Time  //起始时间（用来计算有没有超时）
 }
 
 type Master struct {
-	files     []string
-	nReduce   int
-	taskPhase TaskPhase
-	taskStats []TaskStat
-	mu        sync.Mutex
-	done      bool
-	workerSeq int
-	taskCh    chan Task
-	statCh    chan bool
+	files     []string   //需要处理的files
+	nReduce   int        //输入的参数nReduce（输入的文件会被划分成几个task来处理）
+	taskPhase TaskPhase  //taskPhase（map阶段还是reduce阶段）
+	taskStats []TaskStat //taskStats（各个task的状态）
+	mu        sync.Mutex //mu（全局锁）
+	done      bool       //done（任务是否已完成）
+	workerSeq int        //workerSeq（有几个worker）
+	taskCh    chan Task  //taskCh（用来分发task的channel）
+	statCh    chan bool  //statCh（用来接受各task状态的channel）
 }
 
 func (m *Master) getTask(taskSeq int) Task {
@@ -60,7 +60,7 @@ func (m *Master) getTask(taskSeq int) Task {
 	return task
 }
 
-func (m *Master) taskSchedule(taskSeq int) {
+func (m *Master) taskSchedule(taskSeq int, wg *sync.WaitGroup) {
 	if m.Done() {
 		return
 	}
@@ -89,8 +89,8 @@ func (m *Master) taskSchedule(taskSeq int) {
 		m.statCh <- false
 		panic("t.status err")
 	}
-	// DPrintf("end,task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
 	defer m.taskStats[taskSeq].mu.Unlock()
+	defer wg.Done()
 }
 
 func (m *Master) initMapTask() {
@@ -154,7 +154,6 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 		m.taskStats[args.Seq].Status = TaskStatusErr
 	}
 
-	// go m.schedule()
 	go m.tickSingleTimer()
 	return nil
 }
@@ -202,13 +201,16 @@ func (m *Master) tickSchedule() {
 
 func (m *Master) tickSingleTimer() {
 	allFinish := true
+	var wg sync.WaitGroup
+	wg.Add(len(m.taskStats))
 	for index := range m.taskStats {
-		go m.taskSchedule(index)
+		go m.taskSchedule(index, &wg)
 	}
 	for range m.taskStats {
 		finStat := <-m.statCh
 		allFinish = allFinish && finStat
 	}
+	wg.Wait()
 	if allFinish {
 		if m.taskPhase == MapPhase {
 			log.Println("map done")
