@@ -29,6 +29,14 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func reduceName(mapIdx, reduceIdx int) string {
+	return fmt.Sprintf("mr-%d-%d", mapIdx, reduceIdx)
+}
+
+func mergeName(reduceIdx int) string {
+	return fmt.Sprintf("mr-out-%d", reduceIdx)
+}
+
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
 
@@ -162,7 +170,7 @@ func (w *worker) doReduceTask(t Task) {
 
 func (w *worker) reportTask(t Task, done bool, err error) {
 	if err != nil {
-		log.Printf("%v", err)
+		DPrintf("%v", err)
 	}
 	args := ReportTaskArgs{}
 	args.Done = done

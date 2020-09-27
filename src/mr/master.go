@@ -53,7 +53,7 @@ func (m *Master) getTask(taskSeq int) Task {
 		Phase:    m.taskPhase,
 		Alive:    true,
 	}
-	DPrintf("m:%+v, taskseq:%d, lenfiles:%d, lents:%d", m, taskSeq, len(m.files), len(m.taskStats))
+	DPrintf("Master:%+v, taskseq:%d, lenfiles:%d, lents:%d", m, taskSeq, len(m.files), len(m.taskStats))
 	if task.Phase == MapPhase {
 		task.FileName = m.files[taskSeq]
 	}
@@ -65,7 +65,7 @@ func (m *Master) taskSchedule(taskSeq int, wg *sync.WaitGroup) {
 		return
 	}
 	m.taskStats[taskSeq].mu.Lock()
-	DPrintf("begin,task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
+	DPrintf("Schedule begin, task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
 	switch m.taskStats[taskSeq].Status {
 	case TaskStatusReady:
 		m.statCh <- false
@@ -75,7 +75,7 @@ func (m *Master) taskSchedule(taskSeq int, wg *sync.WaitGroup) {
 		m.statCh <- false
 	case TaskStatusRunning:
 		m.statCh <- false
-		if time.Now().Sub(m.taskStats[taskSeq].StartTime) > MaxTaskRunTime {
+		if time.Since(m.taskStats[taskSeq].StartTime) > MaxTaskRunTime {
 			m.taskStats[taskSeq].Status = TaskStatusQueue
 			m.taskCh <- m.getTask(taskSeq)
 		}
@@ -96,6 +96,7 @@ func (m *Master) taskSchedule(taskSeq int, wg *sync.WaitGroup) {
 func (m *Master) initMapTask() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	DPrintf("Init Map Task")
 	m.taskPhase = MapPhase
 	m.taskStats = make([]TaskStat, len(m.files))
 	for index := range m.taskStats {
@@ -106,7 +107,7 @@ func (m *Master) initMapTask() {
 func (m *Master) initReduceTask() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	DPrintf("init ReduceTask")
+	DPrintf("Init Reduce Task")
 	m.taskPhase = ReducePhase
 	m.taskStats = make([]TaskStat, m.nReduce)
 	for index := range m.taskStats {
@@ -119,7 +120,7 @@ func (m *Master) regTask(args *TaskArgs, task *Task) {
 	defer m.taskStats[task.Seq].mu.Unlock()
 
 	if task.Phase != m.taskPhase {
-		panic("req Task phase neq")
+		panic("Task phase doesn't match")
 	}
 
 	m.taskStats[task.Seq].Status = TaskStatusRunning
@@ -134,7 +135,7 @@ func (m *Master) GetOneTask(args *TaskArgs, reply *TaskReply) error {
 	if task.Alive {
 		m.regTask(args, &task)
 	}
-	DPrintf("in get one Task, args:%+v, reply:%+v", args, reply)
+	DPrintf("Get one Task, args:%+v, reply:%+v", args, reply)
 	return nil
 }
 
@@ -142,7 +143,7 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 	m.taskStats[args.Seq].mu.Lock()
 	defer m.taskStats[args.Seq].mu.Unlock()
 
-	DPrintf("get report task: %+v, taskPhase: %+v", args, m.taskPhase)
+	DPrintf("Get report task: %+v, taskPhase: %+v", args, m.taskPhase)
 
 	if m.taskPhase != args.Phase || args.WorkerId != m.taskStats[args.Seq].WorkerId {
 		return nil
@@ -172,7 +173,6 @@ func (m *Master) RegWorker(args *RegisterArgs, reply *RegisterReply) error {
 func (m *Master) server() {
 	rpc.Register(m)
 	rpc.HandleHTTP()
-	//l, e := net.Listen("tcp", ":1234")
 	sockname := masterSock()
 	os.Remove(sockname)
 	l, e := net.Listen("unix", sockname)
@@ -213,7 +213,6 @@ func (m *Master) tickSingleTimer() {
 	wg.Wait()
 	if allFinish {
 		if m.taskPhase == MapPhase {
-			log.Println("map done")
 			m.initReduceTask()
 		} else {
 			m.mu.Lock()
@@ -242,6 +241,6 @@ func MakeMaster(files []string, nReduce int) *Master {
 	m.initMapTask()
 	go m.tickSchedule()
 	m.server()
-	DPrintf("master init")
+	DPrintf("Master init")
 	return &m
 }
