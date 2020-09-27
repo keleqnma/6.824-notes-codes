@@ -7,13 +7,6 @@ import (
 	"time"
 )
 
-type TaskPhase int
-
-const (
-	MapPhase TaskPhase = iota
-	ReducePhase
-)
-
 const Debug = true
 
 func DPrintf(format string, v ...interface{}) {
@@ -23,7 +16,7 @@ func DPrintf(format string, v ...interface{}) {
 
 		if ok {
 			t := time.Now()
-			a := []interface{}{t.Format("2006-01-02 15:04:05.00"), file, lineno}
+			a := append([]interface{}{t.Format("2006-01-02 15:04:05.00"), file, lineno}, v...)
 			fmt.Printf("%s [%s:%d] "+format+"\n", a...)
 		}
 	}
@@ -42,13 +35,4 @@ func Max(a int, b int) int {
 	} else {
 		return b
 	}
-}
-
-type Task struct {
-	FileName string
-	NReduce  int
-	NMaps    int
-	Seq      int
-	Phase    TaskPhase
-	Alive    bool // worker should exit when alive is false
 }

@@ -6,8 +6,10 @@ package mr
 // remember to capitalize all names.
 //
 
-import "os"
-import "strconv"
+import (
+	"os"
+	"strconv"
+)
 
 //
 // example to show how to declare the arguments
@@ -23,6 +25,21 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+type TaskPhase int
+
+const (
+	MapPhase TaskPhase = iota
+	ReducePhase
+)
+
+type Task struct {
+	FileName string
+	NReduce  int
+	NMaps    int
+	Seq      int
+	Phase    TaskPhase
+	Alive    bool // worker should exit when alive is false
+}
 
 type TaskArgs struct {
 	WorkerId int

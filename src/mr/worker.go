@@ -85,7 +85,7 @@ func (w *worker) reqTask() Task {
 }
 
 func (w *worker) doTask(t Task) {
-	DPrintf("in do Task")
+	DPrintf("Worker do Task")
 
 	switch t.Phase {
 	case MapPhase:
