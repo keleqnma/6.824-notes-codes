@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-const Debug = true
+const Debug = false
 
 func DPrintf(format string, v ...interface{}) {
 	if Debug {

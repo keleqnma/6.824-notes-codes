@@ -7,7 +7,6 @@ import (
 	"net/rpc"
 	"os"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -66,7 +65,6 @@ func (m *Master) taskSchedule(taskSeq int) {
 		if m.Done() {
 			return
 		}
-		returnStatus := false
 		m.mu.Lock()
 		DPrintf("Schedule begin, task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
 		switch m.taskStats[taskSeq].Status {
@@ -80,20 +78,18 @@ func (m *Master) taskSchedule(taskSeq int) {
 				m.taskCh <- m.getTask(taskSeq)
 			}
 		case TaskStatusFinish:
-			atomic.AddInt32(&m.finishTask, 1)
-			returnStatus = true
+			m.finishTask += 1
+			m.mu.Unlock()
+			return
 		case TaskStatusErr:
 			m.taskStats[taskSeq].Status = TaskStatusQueue
 			m.taskCh <- m.getTask(taskSeq)
 		default:
+			m.mu.Unlock()
 			panic("Task status err")
-			returnStatus = true
 		}
 		DPrintf("Schedule end, task:%v, Status: %v", taskSeq, m.taskStats[taskSeq].Status)
 		m.mu.Unlock()
-		if returnStatus {
-			return
-		}
 		time.Sleep(ScheduleInterval)
 	}
 }
@@ -205,9 +201,9 @@ func (m *Master) Done() bool {
 
 func (m *Master) tickSchedule() {
 	for !m.Done() {
-		DPrintf("Global schedule, finTask:%v, taskNum:%v\n", m.finishTask, m.taskNum)
 		m.mu.Lock()
-		if atomic.LoadInt32(&m.finishTask) == int32(m.taskNum) {
+		DPrintf("Global schedule, finTask:%v, taskNum:%v\n", m.finishTask, m.taskNum)
+		if m.finishTask == int32(m.taskNum) {
 			if m.taskPhase == MapPhase {
 				m.mu.Unlock()
 				m.initReduceTask()

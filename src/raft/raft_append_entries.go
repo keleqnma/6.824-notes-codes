@@ -136,7 +136,7 @@ func (rf *Raft) getAppendEntriesArgs(peerIdx int) AppendEntriesArgs {
 }
 
 func (rf *Raft) resetHeartBeatTimers() {
-	for i, _ := range rf.appendEntriesTimers {
+	for i := range rf.appendEntriesTimers {
 		rf.appendEntriesTimers[i].Stop()
 		rf.appendEntriesTimers[i].Reset(0)
 	}

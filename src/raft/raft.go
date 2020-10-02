@@ -24,6 +24,8 @@ import (
 	"labrpc"
 	"log"
 	"math/rand"
+	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -49,29 +51,6 @@ const (
 	Candidate Role = 1
 	Leader    Role = 2
 )
-
-//
-// as each Raft peer becomes aware that successive log entries are
-// committed, the peer should send an ApplyMsg to the service (or
-// tester) on the same server, via the applyCh passed to Make(). set
-// CommandValid to true to indicate that the ApplyMsg contains a newly
-// committed log entry.
-//
-// in Lab 3 you'll want to send other kinds of messages (e.g.,
-// snapshots) on the applyCh; at that point you can add fields to
-// ApplyMsg, but set CommandValid to false for these other uses.
-//
-type ApplyMsg struct {
-	CommandValid bool
-	CommandIndex int
-	Command      interface{}
-}
-
-type LogEntry struct {
-	Term    int
-	Idx     int // only for debug log
-	Command interface{}
-}
 
 //
 // A Go object implementing a single Raft peer.
@@ -105,11 +84,9 @@ type Raft struct {
 	nextIndex         []int // 下一个要发送的
 	matchIndex        []int // 确认 match 的
 
-	DebugLog  bool      // print log
 	lockStart time.Time // debug 用，找出长时间 lock
 	lockEnd   time.Time
 	lockName  string
-	gid       int
 }
 
 // return currentTerm and whether this server
@@ -281,14 +258,20 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) log(format string, a ...interface{}) {
-	if rf.DebugLog == false {
-		return
+	if Debug > 0 {
+		if Debug > 0 {
+			_, path, lineno, ok := runtime.Caller(1)
+			_, file := filepath.Split(path)
+			term, idx := rf.lastLogTermIndex()
+			fmt.Printf("me: %d, role:%v, term:%d, commitIdx: %v, snidx:%d, apply:%v, matchidx: %v, nextidx:%+v, lastlogterm:%d, idx:%d \n",
+				rf.me, rf.role, rf.term, rf.commitIndex, rf.lastSnapshotIndex, rf.lastApplied, rf.matchIndex, rf.nextIndex, term, idx)
+			if ok {
+				t := time.Now()
+				a = append([]interface{}{t.Format("2006-01-02 15:04:05.00"), file, lineno}, a...)
+				fmt.Printf("%s [%s:%d] "+format+"\n\n", a...)
+			}
+		}
 	}
-	term, idx := rf.lastLogTermIndex()
-	r := fmt.Sprintf(format, a...)
-	s := fmt.Sprintf("gid:%d, me: %d, role:%v,term:%d, commitIdx: %v, snidx:%d, apply:%v, matchidx: %v, nextidx:%+v, lastlogterm:%d,idx:%d",
-		rf.gid, rf.me, rf.role, rf.term, rf.commitIndex, rf.lastSnapshotIndex, rf.lastApplied, rf.matchIndex, rf.nextIndex, term, idx)
-	log.Printf("%s:log:%s\n", s, r)
 }
 
 func (rf *Raft) startApplyLogs() {
@@ -359,20 +342,12 @@ func randElectionTimeout() time.Duration {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 //
-func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg, gid ...int) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 	rf.applyCh = applyCh
-
-	rf.DebugLog = false
-	// gid for test
-	if len(gid) != 0 {
-		rf.gid = gid[0]
-	} else {
-		rf.gid = -1
-	}
 
 	// Your initialization code here (2A, 2B, 2C).
 	// initialize from state persisted before a crash
@@ -386,7 +361,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	rf.electionTimer = time.NewTimer(randElectionTimeout())
 	rf.appendEntriesTimers = make([]*time.Timer, len(rf.peers))
-	for i, _ := range rf.peers {
+	for i := range rf.peers {
 		rf.appendEntriesTimers[i] = time.NewTimer(HeartBeatTimeout)
 	}
 	rf.applyTimer = time.NewTimer(ApplyInterval)
@@ -419,7 +394,7 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}()
 
 	// leader 发送日志
-	for i, _ := range peers {
+	for i := range peers {
 		if i == rf.me {
 			continue
 		}
@@ -435,14 +410,6 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		}(i)
 
 	}
-	// for debug
-	//go func() {
-	//	for !rf.killed() {
-	//		time.Sleep(time.Second * 2)
-	//		fmt.Println(fmt.Sprintf("rf who has lock:%s, time:%v", rf.lockName, time.Now().Sub(rf.lockStart)))
-	//	}
-	//
-	//}()
 
 	return rf
 }
