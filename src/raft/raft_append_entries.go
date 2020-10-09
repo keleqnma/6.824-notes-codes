@@ -4,21 +4,6 @@ import (
 	"time"
 )
 
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderId     int
-	PrevLogIndex int        //紧邻新日志条目之前的那个日志条目的索引
-	PervLogTerm  int        //紧邻新日志条目之前的那个日志条目的任期
-	Entries      []LogEntry //需要被保存的日志条目（被当做心跳使用时日志条目内容为空；为了提高效率可能一次性发送多个）
-	LeaderCommit int        //领导者的已知已提交的最高的日志条目的索引
-}
-
-type AppendEntriesReply struct {
-	Term      int
-	Success   bool
-	NextIndex int
-}
-
 func (rf *Raft) getNextIndex() int {
 	_, idx := rf.lastLogTermIndex()
 	return idx + 1
@@ -175,7 +160,7 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 		case <-rf.stopCh:
 			return
 		case <-RPCTimer.C:
-			rf.log("appendtopeer, rpctimeout: peer:%d, args:%+v", peerIdx, args)
+			rf.log("append to peer, rpctimeout: peer:%d, args:%+v", peerIdx, args)
 			continue
 		case ok := <-resCh:
 			if !ok {
@@ -184,8 +169,9 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 			}
 		}
 
-		rf.log("appendtoperr, peer:%d, args:%+v, reply:%+v", peerIdx, args, reply)
-		// call ok, check reply
+		rf.log("append to perr, peer:%d, args:%+v, reply:%+v", peerIdx, args, reply)
+
+		// check reply
 		rf.lock("appendtopeer2")
 		if reply.Term > rf.currentTerm {
 			rf.changeRole(Follower)

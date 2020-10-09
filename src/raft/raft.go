@@ -38,7 +38,7 @@ func init() {
 
 const (
 	ElectionInterval = time.Millisecond * 300
-	HeartBeatTimeout = time.Millisecond * 150 // leader 发送心跳
+	HeartBeatTimeout = time.Millisecond * 150 // 心跳间隔，tester限制一秒至多十次心跳
 	ApplyInterval    = time.Millisecond * 100
 	RPCTimeout       = time.Millisecond * 100
 	MaxLockTime      = time.Millisecond * 10
@@ -66,22 +66,23 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role        Role
-	currentTerm int
+	role        Role //当前服务器的角色
+	currentTerm int  //服务器已知最新的任期（在服务器首次启动的时候初始化为0，单调递增）
 
 	electionTimer       *time.Timer
 	appendEntriesTimers []*time.Timer
 	applyTimer          *time.Timer
 	notifyApplyCh       chan struct{}
 	stopCh              chan struct{}
+	voteFor             int // 当前任期内收到选票的候选者id,如果没有投给任何候选者,则为-1
+	applyCh             chan ApplyMsg
 
-	voteFor     int        // server id, -1 for null
 	logEntries  []LogEntry // 日志条目;每个条目包含了用于状态机的命令，以及领导者接收到该条目时的任期（第一个索引为1）,lastSnapshot 放到 index 0
-	applyCh     chan ApplyMsg
-	commitIndex int // 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
-	lastApplied int // 已经被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
+	commitIndex int        // 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
+	lastApplied int        // 已经被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
 
-	//leader状态
+	//leader需要保存的
+
 	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引+1）
 	matchIndex []int // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
 
@@ -95,11 +96,13 @@ type Raft struct {
 
 // return currentTerm and whether this server
 // believes it is the leader.
-func (rf *Raft) GetState() (int, bool) {
+func (rf *Raft) GetState() (term int, isLeader bool) {
 	// Your code here (2A).
 	rf.lock("get state")
 	defer rf.unlock("get state")
-	return rf.currentTerm, rf.role == Leader
+	term, isLeader = rf.currentTerm, rf.role == Leader
+	rf.log("get state, term:%v, isLeader:%v", term, isLeader)
+	return
 }
 
 func (rf *Raft) getPersistData() []byte {
@@ -215,11 +218,49 @@ func (rf *Raft) changeRole(role Role) {
 
 }
 
-// 返回最后一条log的term和index
+// 返回当前服务器最后一条log的term和index
 func (rf *Raft) lastLogTermIndex() (lastLogTerm int, lastLogIndex int) {
 	lastLogTerm = rf.logEntries[len(rf.logEntries)-1].Term
 	lastLogIndex = rf.lastSnapshotIndex + len(rf.logEntries) - 1
 	return
+}
+
+func (rf *Raft) startApplyLogs() {
+	defer rf.applyTimer.Reset(ApplyInterval)
+
+	rf.lock("applyLogs1")
+	var msgs []ApplyMsg
+	if rf.lastApplied < rf.lastSnapshotIndex {
+		msgs = make([]ApplyMsg, 0, 1)
+		msgs = append(msgs, ApplyMsg{
+			CommandValid: false,
+			Command:      "installSnapShot",
+			CommandIndex: rf.lastSnapshotIndex,
+		})
+
+	} else if rf.commitIndex <= rf.lastApplied {
+		// snapShot 没有更新 commitidx
+		msgs = make([]ApplyMsg, 0)
+	} else {
+		rf.log("rfapply")
+		msgs = make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
+		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
+			msgs = append(msgs, ApplyMsg{
+				CommandValid: true,
+				Command:      rf.logEntries[rf.getRealIdxByLogIndex(i)].Command,
+				CommandIndex: i,
+			})
+		}
+	}
+	rf.unlock("applyLogs1")
+
+	for _, msg := range msgs {
+		rf.applyCh <- msg
+		rf.lock("applyLogs2")
+		rf.log("send applych idx:%d", msg.CommandIndex)
+		rf.lastApplied = msg.CommandIndex
+		rf.unlock("applyLogs2")
+	}
 }
 
 func (rf *Raft) getLogByIndex(logIndex int) LogEntry {
@@ -370,6 +411,23 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 			}
 		}(i)
 	}
+
+	rf.applyTimer = time.NewTimer(ApplyInterval)
+	rf.notifyApplyCh = make(chan struct{}, 100)
+
+	// apply log
+	go func() {
+		for {
+			select {
+			case <-rf.stopCh:
+				return
+			case <-rf.applyTimer.C:
+				rf.notifyApplyCh <- struct{}{}
+			case <-rf.notifyApplyCh:
+				rf.startApplyLogs()
+			}
+		}
+	}()
 
 	rf.readPersist(persister.ReadRaftState())
 	return rf

@@ -23,26 +23,29 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	switch {
-	case req.Term == rf.currentTerm:
+	// 选举人的term小于当前服务器的term
+	if req.Term < rf.currentTerm {
 		return
-	case req.Term < rf.currentTerm:
-		if rf.role == Leader {
-			return
-		}
-		if rf.voteFor == req.CandidateId {
-			reply.VoteGranted = true
-			return
-		}
-		if rf.voteFor != voteForNobody && rf.voteFor != req.CandidateId {
-			return
-		}
+	}
+	// 已经选举成功
+	if rf.role == Leader {
+		return
+	}
+	// 已经投票给当前候选人
+	if rf.voteFor == req.CandidateId {
+		reply.VoteGranted = true
+		return
+	}
+	// 已经投票，且对象不是当前候选人
+	// 如果当前服务器是候选人，且选举人的term不小于当前服务器的term，则它会转投给选举人
+	if rf.voteFor != voteForNobody && rf.voteFor != req.CandidateId && rf.role == Follower {
+		return
 	}
 
 	defer rf.persist()
 
+	// 候选人最后一条日志的term小于当前服务器最后一条日志的term, 或者候选人最后一条日志的index小于当前服务器最后一条日志的index
 	if lastLogTerm > req.LastLogTerm || (req.LastLogTerm == lastLogTerm && req.LastLogIndex < lastLogIndex) {
-		// 选取限制
 		return
 	}
 
@@ -105,6 +108,7 @@ func (rf *Raft) startElection() {
 	}
 	rf.log("start election")
 	rf.changeRole(Candidate)
+	rf.voteFor = rf.me
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
 	req := RequestVoteArgs{
 		Term:         rf.currentTerm,
@@ -115,8 +119,6 @@ func (rf *Raft) startElection() {
 	rf.persist()
 	rf.unlock("start_election")
 
-	grantedCount := 1
-	chResCount := 1
 	votesCh := make(chan bool, len(rf.peers))
 
 	for index := range rf.peers {
@@ -140,6 +142,11 @@ func (rf *Raft) startElection() {
 		}(votesCh, index)
 	}
 
+	chResCount := 1
+	grantedCount := 0
+	if rf.voteFor == rf.me {
+		grantedCount++
+	}
 	for {
 		chResCount += 1
 		if <-votesCh {
