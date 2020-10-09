@@ -44,7 +44,7 @@ func (rf *Raft) SavePersistAndShnapshot(logIndex int, snapshotData []byte) {
 func (rf *Raft) sendInstallSnapshot(peerIdx int) {
 	rf.lock("send_install_snapshot")
 	args := InstallSnapshotArgs{
-		Term:              rf.term,
+		Term:              rf.currentTerm,
 		LeaderId:          rf.me,
 		LastIncludedIndex: rf.lastSnapshotIndex,
 		LastIncludedTerm:  rf.lastSnapshotTerm,
@@ -82,13 +82,13 @@ func (rf *Raft) sendInstallSnapshot(peerIdx int) {
 		// ok == true
 		rf.lock("send_install_snapshot")
 		defer rf.unlock("send_install_snapshot")
-		if rf.term != args.Term || rf.role != Leader {
+		if rf.currentTerm != args.Term || rf.role != Leader {
 			return
 		}
-		if reply.Term > rf.term {
+		if reply.Term > rf.currentTerm {
 			rf.changeRole(Follower)
 			rf.resetElectionTimer()
-			rf.term = reply.Term
+			rf.currentTerm = reply.Term
 			rf.persist()
 			return
 		}
@@ -109,12 +109,12 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.lock("install_snapshot")
 	defer rf.unlock("install_snapshot")
 
-	reply.Term = rf.term
-	if args.Term < rf.term {
+	reply.Term = rf.currentTerm
+	if args.Term < rf.currentTerm {
 		return
 	}
-	if args.Term > rf.term || rf.role != Follower {
-		rf.term = args.Term
+	if args.Term > rf.currentTerm || rf.role != Follower {
+		rf.currentTerm = args.Term
 		rf.changeRole(Follower)
 		rf.resetElectionTimer()
 		defer rf.persist()

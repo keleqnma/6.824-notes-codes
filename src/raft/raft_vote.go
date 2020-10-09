@@ -1,72 +1,57 @@
 package raft
 
 import (
+	"math/rand"
 	"time"
 )
 
-type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
-	Term         int
-	CandidateId  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type RequestVoteReply struct {
-	// Your data here (2A).
-	Term        int
-	VoteGranted bool
+func randElectionTimeout() time.Duration {
+	r := time.Duration(rand.Int63()) % ElectionInterval
+	return ElectionInterval + r
 }
 
 // example RequestVote RPC handler.
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.lock("req_vote")
 	defer rf.unlock("req_vote")
 	defer func() {
-		rf.log("get request vote, args:%+v, reply:%+v", args, reply)
+		rf.log("get request vote, req:%+v, reply:%+v", req, reply)
 	}()
 
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
-	reply.Term = rf.term
+	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	if args.Term < rf.term {
+	switch {
+	case req.Term == rf.currentTerm:
 		return
-	} else if args.Term == rf.term {
+	case req.Term < rf.currentTerm:
 		if rf.role == Leader {
 			return
 		}
-		if rf.voteFor == args.CandidateId {
+		if rf.voteFor == req.CandidateId {
 			reply.VoteGranted = true
 			return
 		}
-		if rf.voteFor != -1 && rf.voteFor != args.CandidateId {
-			// 已投给其他 server
+		if rf.voteFor != voteForNobody && rf.voteFor != req.CandidateId {
 			return
 		}
-		// 还一种可能:没有投票
 	}
 
 	defer rf.persist()
-	if args.Term > rf.term {
-		rf.term = args.Term
-		rf.voteFor = -1
-		rf.changeRole(Follower)
-	}
 
-	if lastLogTerm > args.LastLogTerm || (args.LastLogTerm == lastLogTerm && args.LastLogIndex < lastLogIndex) {
+	if lastLogTerm > req.LastLogTerm || (req.LastLogTerm == lastLogTerm && req.LastLogIndex < lastLogIndex) {
 		// 选取限制
 		return
 	}
 
-	rf.term = args.Term
-	rf.voteFor = args.CandidateId
+	rf.currentTerm = req.Term
+	rf.voteFor = req.CandidateId
 	reply.VoteGranted = true
 	rf.changeRole(Follower)
 	rf.resetElectionTimer()
-	rf.log("vote for:%d", args.CandidateId)
-	return
+	rf.log("vote for:%d", req.CandidateId)
 }
 
 func (rf *Raft) resetElectionTimer() {
@@ -75,9 +60,6 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 func (rf *Raft) sendRequestVoteToPeer(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	// 当网络出错 call 迅速返回时，会产生大量 goroutine 及 rpc
-	// 所以加了 sleep
-	// TODO
 	t := time.NewTimer(RPCTimeout)
 	defer t.Stop()
 	rpcTimer := time.NewTimer(RPCTimeout)
@@ -91,7 +73,7 @@ func (rf *Raft) sendRequestVoteToPeer(server int, args *RequestVoteArgs, reply *
 
 		go func() {
 			ok := rf.peers[server].Call("Raft.RequestVote", args, &r)
-			if ok == false {
+			if !ok {
 				time.Sleep(time.Millisecond * 10)
 			}
 			ch <- ok
@@ -124,8 +106,8 @@ func (rf *Raft) startElection() {
 	rf.log("start election")
 	rf.changeRole(Candidate)
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
-	args := RequestVoteArgs{
-		Term:         rf.term,
+	req := RequestVoteArgs{
+		Term:         rf.currentTerm,
 		CandidateId:  rf.me,
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
@@ -136,18 +118,19 @@ func (rf *Raft) startElection() {
 	grantedCount := 1
 	chResCount := 1
 	votesCh := make(chan bool, len(rf.peers))
-	for index, _ := range rf.peers {
+
+	for index := range rf.peers {
 		if index == rf.me {
 			continue
 		}
-		go func(ch chan bool, index int) {
+		go func(votesCh chan bool, index int) {
 			reply := RequestVoteReply{}
-			rf.sendRequestVoteToPeer(index, &args, &reply)
-			ch <- reply.VoteGranted
-			if reply.Term > args.Term {
+			rf.sendRequestVoteToPeer(index, &req, &reply)
+			votesCh <- reply.VoteGranted
+			if reply.Term > req.Term {
 				rf.lock("start_ele_change_term")
-				if rf.term < reply.Term {
-					rf.term = reply.Term
+				if rf.currentTerm < reply.Term {
+					rf.currentTerm = reply.Term
 					rf.changeRole(Follower)
 					rf.resetElectionTimer()
 					rf.persist()
@@ -158,9 +141,8 @@ func (rf *Raft) startElection() {
 	}
 
 	for {
-		r := <-votesCh
 		chResCount += 1
-		if r == true {
+		if <-votesCh {
 			grantedCount += 1
 		}
 		if chResCount == len(rf.peers) || grantedCount > len(rf.peers)/2 || chResCount-grantedCount > len(rf.peers)/2 {
@@ -169,18 +151,20 @@ func (rf *Raft) startElection() {
 	}
 
 	if grantedCount <= len(rf.peers)/2 {
-		rf.log("grantedCount <= len/2:count:%d", grantedCount)
+		rf.log("grantedCount <= len/2, len:%d, count:%d", len(rf.peers), grantedCount)
 		return
 	}
 
 	rf.lock("start_ele2")
-	rf.log("before try change to leader,count:%d, args:%+v", grantedCount, args)
-	if rf.term == args.Term && rf.role == Candidate {
+	rf.log("before try change to leader, count:%d, args:%+v", grantedCount, req)
+	if rf.currentTerm == req.Term && rf.role == Candidate {
 		rf.changeRole(Leader)
 		rf.persist()
 	}
+
 	if rf.role == Leader {
 		rf.resetHeartBeatTimers()
 	}
+
 	rf.unlock("start_ele2")
 }

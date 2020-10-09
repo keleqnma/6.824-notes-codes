@@ -37,19 +37,20 @@ func init() {
 }
 
 const (
-	ElectionTimeout  = time.Millisecond * 300 // 选举
+	ElectionInterval = time.Millisecond * 300
 	HeartBeatTimeout = time.Millisecond * 150 // leader 发送心跳
-	ApplyInterval    = time.Millisecond * 100 // apply log
+	ApplyInterval    = time.Millisecond * 100
 	RPCTimeout       = time.Millisecond * 100
-	MaxLockTime      = time.Millisecond * 10 // debug
+	MaxLockTime      = time.Millisecond * 10
+	voteForNobody    = -1
 )
 
 type Role int
 
 const (
-	Follower  Role = 0
-	Candidate Role = 1
-	Leader    Role = 2
+	Follower Role = iota
+	Candidate
+	Leader
 )
 
 //
@@ -65,8 +66,8 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
-	role Role
-	term int
+	role        Role
+	currentTerm int
 
 	electionTimer       *time.Timer
 	appendEntriesTimers []*time.Timer
@@ -74,15 +75,18 @@ type Raft struct {
 	notifyApplyCh       chan struct{}
 	stopCh              chan struct{}
 
-	voteFor           int        // server id, -1 for null
-	logEntries        []LogEntry // lastSnapshot 放到 index 0
-	applyCh           chan ApplyMsg
-	commitIndex       int
+	voteFor     int        // server id, -1 for null
+	logEntries  []LogEntry // 日志条目;每个条目包含了用于状态机的命令，以及领导者接收到该条目时的任期（第一个索引为1）,lastSnapshot 放到 index 0
+	applyCh     chan ApplyMsg
+	commitIndex int // 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
+	lastApplied int // 已经被应用到状态机的最高的日志条目的索引（初始值为0，单调递增）
+
+	//leader状态
+	nextIndex  []int // 对于每一台服务器，发送到该服务器的下一个日志条目的索引（初始值为领导者最后的日志条目的索引+1）
+	matchIndex []int // 对于每一台服务器，已知的已经复制到该服务器的最高日志条目的索引（初始值为0，单调递增）
+
 	lastSnapshotIndex int // 快照中的 index
 	lastSnapshotTerm  int
-	lastApplied       int   // 此 server 的 log commit
-	nextIndex         []int // 下一个要发送的
-	matchIndex        []int // 确认 match 的
 
 	lockStart time.Time // debug 用，找出长时间 lock
 	lockEnd   time.Time
@@ -95,18 +99,31 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.lock("get state")
 	defer rf.unlock("get state")
-	return rf.term, rf.role == Leader
+	return rf.currentTerm, rf.role == Leader
 }
 
 func (rf *Raft) getPersistData() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
-	e.Encode(rf.term)
-	e.Encode(rf.voteFor)
-	e.Encode(rf.commitIndex)
-	e.Encode(rf.lastSnapshotIndex)
-	e.Encode(rf.lastSnapshotTerm)
-	e.Encode(rf.logEntries)
+
+	if err := e.Encode(rf.currentTerm); err != nil {
+		rf.log("encode term error:%v", err)
+	}
+	if err := e.Encode(rf.voteFor); err != nil {
+		rf.log("encode votefor error:%v", err)
+	}
+	if err := e.Encode(rf.commitIndex); err != nil {
+		rf.log("encode commitIndex error:%v", err)
+	}
+	if err := e.Encode(rf.lastSnapshotIndex); err != nil {
+		rf.log("encode lastSnapshotIndex error:%v", err)
+	}
+	if err := e.Encode(rf.lastSnapshotTerm); err != nil {
+		rf.log("encode lastSnapshotTerm error:%v", err)
+	}
+	if err := e.Encode(rf.logEntries); err != nil {
+		rf.log("encode logEntries error:%v", err)
+	}
 	data := w.Bytes()
 	return data
 }
@@ -117,6 +134,7 @@ func (rf *Raft) getPersistData() []byte {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
+	rf.log("begin persist")
 	data := rf.getPersistData()
 	rf.persister.SaveRaftState(data)
 }
@@ -143,9 +161,9 @@ func (rf *Raft) readPersist(data []byte) {
 		d.Decode(&lastSnapshotIndex) != nil ||
 		d.Decode(&lastSnapshotTerm) != nil ||
 		d.Decode(&logs) != nil {
-		log.Fatal("rf read persist err")
+		rf.log("rf read persist err")
 	} else {
-		rf.term = term
+		rf.currentTerm = term
 		rf.voteFor = voteFor
 		rf.commitIndex = commitIndex
 		rf.lastSnapshotIndex = lastSnapshotIndex
@@ -175,10 +193,12 @@ func (rf *Raft) changeRole(role Role) {
 	rf.role = role
 	switch role {
 	case Follower:
+		rf.log("change to follower")
 	case Candidate:
-		rf.term += 1
+		rf.currentTerm += 1
 		rf.voteFor = rf.me
 		rf.resetElectionTimer()
+		rf.log("change to candidate")
 	case Leader:
 		_, lastLogIndex := rf.lastLogTermIndex()
 		rf.nextIndex = make([]int, len(rf.peers))
@@ -188,16 +208,32 @@ func (rf *Raft) changeRole(role Role) {
 		rf.matchIndex = make([]int, len(rf.peers))
 		rf.matchIndex[rf.me] = lastLogIndex
 		rf.resetElectionTimer()
+		rf.log("change to leader")
 	default:
 		panic("unknown role")
 	}
 
 }
 
-func (rf *Raft) lastLogTermIndex() (int, int) {
-	term := rf.logEntries[len(rf.logEntries)-1].Term
-	index := rf.lastSnapshotIndex + len(rf.logEntries) - 1
-	return term, index
+// 返回最后一条log的term和index
+func (rf *Raft) lastLogTermIndex() (lastLogTerm int, lastLogIndex int) {
+	lastLogTerm = rf.logEntries[len(rf.logEntries)-1].Term
+	lastLogIndex = rf.lastSnapshotIndex + len(rf.logEntries) - 1
+	return
+}
+
+func (rf *Raft) getLogByIndex(logIndex int) LogEntry {
+	idx := logIndex - rf.lastSnapshotIndex
+	return rf.logEntries[idx]
+}
+
+func (rf *Raft) getRealIdxByLogIndex(logIndex int) int {
+	idx := logIndex - rf.lastSnapshotIndex
+	if idx < 0 {
+		return -1
+	} else {
+		return idx
+	}
 }
 
 //
@@ -217,14 +253,14 @@ func (rf *Raft) lastLogTermIndex() (int, int) {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.lock("start")
-	term := rf.term
-	isLeader := rf.role == Leader
+	term := rf.currentTerm
 	_, lastIndex := rf.lastLogTermIndex()
 	index := lastIndex + 1
 
+	isLeader := (rf.role == Leader)
 	if isLeader {
 		rf.logEntries = append(rf.logEntries, LogEntry{
-			Term:    rf.term,
+			Term:    rf.currentTerm,
 			Command: command,
 			Idx:     index,
 		})
@@ -253,8 +289,7 @@ func (rf *Raft) Kill() {
 }
 
 func (rf *Raft) killed() bool {
-	z := atomic.LoadInt32(&rf.dead)
-	return z == 1
+	return atomic.LoadInt32(&rf.dead) == 1
 }
 
 func (rf *Raft) log(format string, a ...interface{}) {
@@ -262,73 +297,14 @@ func (rf *Raft) log(format string, a ...interface{}) {
 		if Debug > 0 {
 			_, path, lineno, ok := runtime.Caller(1)
 			_, file := filepath.Split(path)
-			term, idx := rf.lastLogTermIndex()
-			fmt.Printf("me: %d, role:%v, term:%d, commitIdx: %v, snidx:%d, apply:%v, matchidx: %v, nextidx:%+v, lastlogterm:%d, idx:%d \n",
-				rf.me, rf.role, rf.term, rf.commitIndex, rf.lastSnapshotIndex, rf.lastApplied, rf.matchIndex, rf.nextIndex, term, idx)
 			if ok {
 				t := time.Now()
 				a = append([]interface{}{t.Format("2006-01-02 15:04:05.00"), file, lineno}, a...)
+				fmt.Printf("me: %d, role:%v, term:%d\n", rf.me, rf.role, rf.currentTerm)
 				fmt.Printf("%s [%s:%d] "+format+"\n\n", a...)
 			}
 		}
 	}
-}
-
-func (rf *Raft) startApplyLogs() {
-	defer rf.applyTimer.Reset(ApplyInterval)
-
-	rf.lock("applyLogs1")
-	var msgs []ApplyMsg
-	if rf.lastApplied < rf.lastSnapshotIndex {
-		msgs = make([]ApplyMsg, 0, 1)
-		msgs = append(msgs, ApplyMsg{
-			CommandValid: false,
-			Command:      "installSnapShot",
-			CommandIndex: rf.lastSnapshotIndex,
-		})
-
-	} else if rf.commitIndex <= rf.lastApplied {
-		// snapShot 没有更新 commitidx
-		msgs = make([]ApplyMsg, 0)
-	} else {
-		rf.log("rfapply")
-		msgs = make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
-		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
-			msgs = append(msgs, ApplyMsg{
-				CommandValid: true,
-				Command:      rf.logEntries[rf.getRealIdxByLogIndex(i)].Command,
-				CommandIndex: i,
-			})
-		}
-	}
-	rf.unlock("applyLogs1")
-
-	for _, msg := range msgs {
-		rf.applyCh <- msg
-		rf.lock("applyLogs2")
-		rf.log("send applych idx:%d", msg.CommandIndex)
-		rf.lastApplied = msg.CommandIndex
-		rf.unlock("applyLogs2")
-	}
-}
-
-func (rf *Raft) getLogByIndex(logIndex int) LogEntry {
-	idx := logIndex - rf.lastSnapshotIndex
-	return rf.logEntries[idx]
-}
-
-func (rf *Raft) getRealIdxByLogIndex(logIndex int) int {
-	idx := logIndex - rf.lastSnapshotIndex
-	if idx < 0 {
-		return -1
-	} else {
-		return idx
-	}
-}
-
-func randElectionTimeout() time.Duration {
-	r := time.Duration(rand.Int63()) % ElectionTimeout
-	return ElectionTimeout + r
 }
 
 //
@@ -353,35 +329,16 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	// initialize from state persisted before a crash
 
 	rf.stopCh = make(chan struct{})
-	rf.term = 0
-	rf.voteFor = -1
+	rf.currentTerm = 0
+	rf.voteFor = voteForNobody
 	rf.role = Follower
 	rf.logEntries = make([]LogEntry, 1) // idx ==0 存放 lastSnapshot
 	rf.readPersist(persister.ReadRaftState())
 
-	rf.electionTimer = time.NewTimer(randElectionTimeout())
-	rf.appendEntriesTimers = make([]*time.Timer, len(rf.peers))
-	for i := range rf.peers {
-		rf.appendEntriesTimers[i] = time.NewTimer(HeartBeatTimeout)
-	}
-	rf.applyTimer = time.NewTimer(ApplyInterval)
-	rf.notifyApplyCh = make(chan struct{}, 100)
-
-	// apply log
-	go func() {
-		for {
-			select {
-			case <-rf.stopCh:
-				return
-			case <-rf.applyTimer.C:
-				rf.notifyApplyCh <- struct{}{}
-			case <-rf.notifyApplyCh:
-				rf.startApplyLogs()
-			}
-		}
-	}()
+	rf.log("raft server %d begin initialization", me)
 
 	// 发起投票
+	rf.electionTimer = time.NewTimer(randElectionTimeout())
 	go func() {
 		for {
 			select {
@@ -394,6 +351,10 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	}()
 
 	// leader 发送日志
+	rf.appendEntriesTimers = make([]*time.Timer, len(rf.peers))
+	for i := range rf.peers {
+		rf.appendEntriesTimers[i] = time.NewTimer(HeartBeatTimeout)
+	}
 	for i := range peers {
 		if i == rf.me {
 			continue
@@ -408,8 +369,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 				}
 			}
 		}(i)
-
 	}
 
+	rf.readPersist(persister.ReadRaftState())
 	return rf
 }

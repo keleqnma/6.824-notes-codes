@@ -6,3 +6,4 @@ src/main/mr-tmp/
 src/main/mrmaster                    
 src/main/mrsequential                      
 src/main/mrworker 
+.idea/

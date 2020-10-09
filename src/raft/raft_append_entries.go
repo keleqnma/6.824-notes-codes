@@ -7,10 +7,10 @@ import (
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
-	PrevLogIndex int
-	PervLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
+	PrevLogIndex int        //紧邻新日志条目之前的那个日志条目的索引
+	PervLogTerm  int        //紧邻新日志条目之前的那个日志条目的任期
+	Entries      []LogEntry //需要被保存的日志条目（被当做心跳使用时日志条目内容为空；为了提高效率可能一次性发送多个）
+	LeaderCommit int        //领导者的已知已提交的最高的日志条目的索引
 }
 
 type AppendEntriesReply struct {
@@ -37,14 +37,14 @@ func (rf *Raft) outOfOrderAppendEntries(args *AppendEntriesArgs) bool {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.lock("append_entries")
 	rf.log("get appendentries:%+v", *args)
-	reply.Term = rf.term
+	reply.Term = rf.currentTerm
 
-	if rf.term > args.Term {
+	if rf.currentTerm > args.Term {
 		rf.unlock("append_entries")
 		return
 	}
 
-	rf.term = args.Term
+	rf.currentTerm = args.Term
 	rf.changeRole(Follower)
 	rf.resetElectionTimer()
 	_, lastLogIndex := rf.lastLogTermIndex()
@@ -123,15 +123,12 @@ func (rf *Raft) getAppendLogs(peerIdx int) (prevLogIndex, prevLogTerm int, res [
 }
 
 func (rf *Raft) getAppendEntriesArgs(peerIdx int) AppendEntriesArgs {
-	prevLogIndex, prevLogTerm, logs := rf.getAppendLogs(peerIdx)
 	args := AppendEntriesArgs{
-		Term:         rf.term,
+		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
-		PrevLogIndex: prevLogIndex,
-		PervLogTerm:  prevLogTerm,
-		Entries:      logs,
 		LeaderCommit: rf.commitIndex,
 	}
+	args.PrevLogIndex, args.PervLogTerm, args.Entries = rf.getAppendLogs(peerIdx)
 	return args
 }
 
@@ -152,12 +149,12 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 	defer RPCTimer.Stop()
 
 	for !rf.killed() {
-		rf.lock("appendtopeer1")
 		if rf.role != Leader {
 			rf.resetHeartBeatTimer(peerIdx)
-			rf.unlock("appendtopeer1")
 			return
 		}
+
+		rf.lock("appendtopeer1")
 		args := rf.getAppendEntriesArgs(peerIdx)
 		rf.resetHeartBeatTimer(peerIdx)
 		rf.unlock("appendtopeer1")
@@ -190,16 +187,16 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 		rf.log("appendtoperr, peer:%d, args:%+v, reply:%+v", peerIdx, args, reply)
 		// call ok, check reply
 		rf.lock("appendtopeer2")
-		if reply.Term > rf.term {
+		if reply.Term > rf.currentTerm {
 			rf.changeRole(Follower)
 			rf.resetElectionTimer()
-			rf.term = reply.Term
+			rf.currentTerm = reply.Term
 			rf.persist()
 			rf.unlock("appendtopeer2")
 			return
 		}
 
-		if rf.role != Leader || rf.term != args.Term {
+		if rf.role != Leader || rf.currentTerm != args.Term {
 			rf.unlock("appendtopeer2")
 			return
 		}
@@ -209,7 +206,7 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 				rf.nextIndex[peerIdx] = reply.NextIndex
 				rf.matchIndex[peerIdx] = reply.NextIndex - 1
 			}
-			if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.term {
+			if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
 				// 只 commit 自己 term 的 index
 				rf.updateCommitIndex()
 			}
@@ -231,10 +228,9 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 				rf.unlock("appendtopeer2")
 				return
 			}
-		} else {
-			// 乱序？
-			rf.unlock("appendtopeer2")
 		}
+		// 乱序？
+		rf.unlock("appendtopeer2")
 	}
 
 }

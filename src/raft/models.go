@@ -22,3 +22,17 @@ type LogEntry struct {
 	Idx     int // only for debug log
 	Command interface{}
 }
+
+type RequestVoteArgs struct {
+	// Your data here (2A, 2B).
+	Term         int
+	CandidateId  int
+	LastLogIndex int
+	LastLogTerm  int
+}
+
+type RequestVoteReply struct {
+	// Your data here (2A).
+	Term        int
+	VoteGranted bool
+}
