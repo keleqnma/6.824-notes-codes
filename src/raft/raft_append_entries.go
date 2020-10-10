@@ -1,8 +1,14 @@
 package raft
 
 import (
+	"math/rand"
 	"time"
 )
+
+func randRPCTimeout() time.Duration {
+	r := time.Duration(rand.Int63()) % RPCTimeout
+	return RPCTimeout + r
+}
 
 func (rf *Raft) getNextIndex() int {
 	_, idx := rf.lastLogTermIndex()
@@ -130,7 +136,7 @@ func (rf *Raft) resetHeartBeatTimer(peerIdx int) {
 }
 
 func (rf *Raft) appendEntriesToPeer(peerIdx int) {
-	RPCTimer := time.NewTimer(RPCTimeout)
+	RPCTimer := time.NewTimer(randRPCTimeout())
 	defer RPCTimer.Stop()
 
 	for !rf.killed() {
@@ -148,10 +154,12 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 		RPCTimer.Reset(RPCTimeout)
 		reply := AppendEntriesReply{}
 		resCh := make(chan bool, 1)
+
 		go func(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 			ok := rf.peers[peerIdx].Call("Raft.AppendEntries", args, reply)
+			//if no reply receive, wait
 			if !ok {
-				time.Sleep(time.Millisecond * 10)
+				time.Sleep(RPCTimeout)
 			}
 			resCh <- ok
 		}(&args, &reply)
@@ -164,15 +172,15 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 			continue
 		case ok := <-resCh:
 			if !ok {
-				rf.log("appendtopeer not ok")
+				rf.log("append to peer no reply, peer:%d, args:%+v", peerIdx, args)
 				continue
 			}
 		}
 
 		rf.log("append to perr, peer:%d, args:%+v, reply:%+v", peerIdx, args, reply)
 
-		// check reply
 		rf.lock("appendtopeer2")
+
 		if reply.Term > rf.currentTerm {
 			rf.changeRole(Follower)
 			rf.resetElectionTimer()

@@ -412,10 +412,9 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		}(i)
 	}
 
+	// apply log
 	rf.applyTimer = time.NewTimer(ApplyInterval)
 	rf.notifyApplyCh = make(chan struct{}, 100)
-
-	// apply log
 	go func() {
 		for {
 			select {
