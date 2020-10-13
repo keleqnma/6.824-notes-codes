@@ -69,12 +69,12 @@ type Raft struct {
 	role        Role //当前服务器的角色
 	currentTerm int  //服务器已知最新的任期（在服务器首次启动的时候初始化为0，单调递增）
 
-	electionTimer       *time.Timer
-	appendEntriesTimers []*time.Timer
-	applyTimer          *time.Timer
+	electionTimer       *time.Timer   // 发起选举的计时器
+	appendEntriesTimers []*time.Timer // appendEntries的计时器，2A中用来发心跳
+	applyTimer          *time.Timer   // apply日志的计时器，2A用不到
 	notifyApplyCh       chan struct{}
 	stopCh              chan struct{}
-	voteFor             int // 当前任期内收到选票的候选者id,如果没有投给任何候选者,则为-1
+	voteFor             int // 当前任期内收到选票的候选者id
 	applyCh             chan ApplyMsg
 
 	logEntries  []LogEntry // 日志条目;每个条目包含了用于状态机的命令，以及领导者接收到该条目时的任期（第一个索引为1）,lastSnapshot 放到 index 0
@@ -263,11 +263,13 @@ func (rf *Raft) startApplyLogs() {
 	}
 }
 
+// 根据index获取日志内容
 func (rf *Raft) getLogByIndex(logIndex int) LogEntry {
 	idx := logIndex - rf.lastSnapshotIndex
 	return rf.logEntries[idx]
 }
 
+// 根据日志index获取该日志在logentries里的真实index
 func (rf *Raft) getRealIdxByLogIndex(logIndex int) int {
 	idx := logIndex - rf.lastSnapshotIndex
 	if idx < 0 {
@@ -294,7 +296,6 @@ func (rf *Raft) getRealIdxByLogIndex(logIndex int) int {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	rf.lock("start")
-	term := rf.currentTerm
 	_, lastIndex := rf.lastLogTermIndex()
 	index := lastIndex + 1
 
@@ -303,14 +304,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logEntries = append(rf.logEntries, LogEntry{
 			Term:    rf.currentTerm,
 			Command: command,
-			Idx:     index,
 		})
 		rf.matchIndex[rf.me] = index
 		rf.persist()
 	}
 	rf.resetHeartBeatTimers()
 	rf.unlock("start")
-	return index, term, isLeader
+	return index, rf.currentTerm, isLeader
 }
 
 //

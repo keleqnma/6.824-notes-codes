@@ -131,7 +131,6 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	} else if start >= len(rf.logEntries) {
 		rf.logEntries = make([]LogEntry, 1)
 		rf.logEntries[0].Term = args.LastIncludedTerm
-		rf.logEntries[0].Idx = args.LastIncludedTerm
 	} else {
 		rf.logEntries = rf.logEntries[start:]
 	}

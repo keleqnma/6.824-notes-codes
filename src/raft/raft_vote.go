@@ -18,16 +18,17 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 	defer func() {
 		rf.log("get request vote, req:%+v, reply:%+v", req, reply)
 	}()
+	defer rf.persist()
 
 	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
 	reply.Term = rf.currentTerm
 	reply.VoteGranted = false
 
-	// 选举人的term小于当前服务器的term
+	// 选举人的term小于当前服务器的term，拒绝投票
 	if req.Term < rf.currentTerm {
 		return
 	}
-	// 已经选举成功
+	// 已经选举成功，拒绝投票
 	if rf.role == Leader {
 		return
 	}
@@ -36,20 +37,19 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		return
 	}
-	// 已经投票，且对象不是当前候选人
-	// 如果当前服务器是候选人，且选举人的term不小于当前服务器的term，则它会转投给选举人
+	// 如果已经投票，且对象不是当前候选人，拒绝投票
+	// 但如果当前服务器不是follwer，且选举人的term不小于当前服务器的term，则它会转投给选举人
 	if rf.voteFor != voteForNobody && rf.voteFor != req.CandidateId && rf.role == Follower {
 		return
 	}
-
-	defer rf.persist()
-
-	// 候选人最后一条日志的term小于当前服务器最后一条日志的term, 或者候选人最后一条日志的index小于当前服务器最后一条日志的index
+	// 候选人最后一条日志的term小于当前服务器最后一条日志的term, 或者候选人最后一条日志的index小于当前服务器最后一条日志的index（即log记录冲突），拒绝投票
 	if lastLogTerm > req.LastLogTerm || (req.LastLogTerm == lastLogTerm && req.LastLogIndex < lastLogIndex) {
 		return
 	}
 
+	// 将自身的term调整为和候选人一致
 	rf.currentTerm = req.Term
+	// 投票给候选人
 	rf.voteFor = req.CandidateId
 	reply.VoteGranted = true
 	rf.changeRole(Follower)
@@ -63,7 +63,7 @@ func (rf *Raft) resetElectionTimer() {
 }
 
 func (rf *Raft) sendRequestVoteToPeer(server int, args *RequestVoteArgs, reply *RequestVoteReply) {
-	t := time.NewTimer(RPCTimeout)
+	t := time.NewTimer(randRPCTimeout())
 	defer t.Stop()
 	rpcTimer := time.NewTimer(RPCTimeout)
 	defer rpcTimer.Stop()
@@ -147,6 +147,7 @@ func (rf *Raft) startElection() {
 	if rf.voteFor == rf.me {
 		grantedCount++
 	}
+
 	for {
 		chResCount += 1
 		if <-votesCh {

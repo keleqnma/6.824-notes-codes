@@ -19,7 +19,6 @@ type ApplyMsg struct {
 
 type LogEntry struct {
 	Term    int
-	Idx     int
 	Command interface{}
 }
 
@@ -42,7 +41,7 @@ type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
 	PrevLogIndex int        //紧邻新日志条目之前的那个日志条目的索引
-	PervLogTerm  int        //紧邻新日志条目之前的那个日志条目的任期
+	PrevLogTerm  int        //紧邻新日志条目之前的那个日志条目的任期
 	Entries      []LogEntry //需要被保存的日志条目（被当做心跳使用时日志条目内容为空；为了提高效率可能一次性发送多个）
 	LeaderCommit int        //Ledaer已知已提交的最高的日志条目的索引
 }

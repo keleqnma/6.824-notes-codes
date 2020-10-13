@@ -507,6 +507,6 @@ func (cfg *config) end() {
 		cfg.mu.Unlock()
 
 		fmt.Printf("  ... Passed --")
-		fmt.Printf("  %4.1f  %d %4d %7d %4d\n", t, npeers, nrpc, nbytes, ncmds)
+		fmt.Printf("  time passed %4.1f, Raft peers: %d, RPC sends:%4d, bytes:%7d, Raft agreements reported:%4d\n", t, npeers, nrpc, nbytes, ncmds)
 	}
 }

@@ -30,25 +30,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.log("get appendentries:%+v", *args)
 	reply.Term = rf.currentTerm
 
+	// 如果发送方的term小于当前term，拒绝添加
 	if rf.currentTerm > args.Term {
 		rf.unlock("append_entries")
 		return
 	}
 
+	// 接收到appendentries后重置选举计时器，并且重置角色
 	rf.currentTerm = args.Term
 	rf.changeRole(Follower)
 	rf.resetElectionTimer()
+
 	_, lastLogIndex := rf.lastLogTermIndex()
 
-	if args.PrevLogIndex < rf.lastSnapshotIndex {
+	switch {
+	case args.PrevLogIndex < rf.lastSnapshotIndex:
 		// 因为 lastsnapshotindex 应该已经被 apply，正常情况不该发生
 		reply.Success = false
 		reply.NextIndex = rf.lastSnapshotIndex + 1
-	} else if args.PrevLogIndex > lastLogIndex {
+	case args.PrevLogIndex > lastLogIndex:
 		// 缺少中间的 log
 		reply.Success = false
 		reply.NextIndex = rf.getNextIndex()
-	} else if args.PrevLogIndex == rf.lastSnapshotIndex {
+	case args.PrevLogIndex == rf.lastSnapshotIndex:
 		// TODO 重复代码
 		// 上一个刚好是快照
 		if rf.outOfOrderAppendEntries(args) {
@@ -59,7 +63,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.logEntries = append(rf.logEntries[:1], args.Entries...) // 保留 logs[0]
 			reply.NextIndex = rf.getNextIndex()
 		}
-	} else if rf.logEntries[rf.getRealIdxByLogIndex(args.PrevLogIndex)].Term == args.PervLogTerm {
+	case rf.logEntries[rf.getRealIdxByLogIndex(args.PrevLogIndex)].Term == args.PrevLogTerm:
 		// 包括刚好是后续的 log 和需要删除部分 两种情况
 		// 乱序的请求返回失败
 		if rf.outOfOrderAppendEntries(args) {
@@ -70,7 +74,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.logEntries = append(rf.logEntries[0:rf.getRealIdxByLogIndex(args.PrevLogIndex)+1], args.Entries...)
 			reply.NextIndex = rf.getNextIndex()
 		}
-	} else {
+	default:
 		rf.log("prev log not match")
 		reply.Success = false
 		// 尝试跳过一个 term
@@ -81,6 +85,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		reply.NextIndex = idx + 1
 	}
+
 	if reply.Success {
 		if rf.commitIndex < args.LeaderCommit {
 			rf.commitIndex = args.LeaderCommit
@@ -93,33 +98,28 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.unlock("append_entries")
 }
 
-func (rf *Raft) getAppendLogs(peerIdx int) (prevLogIndex, prevLogTerm int, res []LogEntry) {
-	nextIdx := rf.nextIndex[peerIdx]
-	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
-	if nextIdx <= rf.lastSnapshotIndex || nextIdx > lastLogIndex {
-		// 没有需要发送的 log
-		prevLogIndex = lastLogIndex
-		prevLogTerm = lastLogTerm
-		return
-	}
-
-	res = append([]LogEntry{}, rf.logEntries[rf.getRealIdxByLogIndex(nextIdx):]...)
-	prevLogIndex = nextIdx - 1
-	if prevLogIndex == rf.lastSnapshotIndex {
-		prevLogTerm = rf.lastSnapshotTerm
-	} else {
-		prevLogTerm = rf.getLogByIndex(prevLogIndex).Term
-	}
-	return
-}
-
 func (rf *Raft) getAppendEntriesArgs(peerIdx int) AppendEntriesArgs {
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
 		LeaderCommit: rf.commitIndex,
 	}
-	args.PrevLogIndex, args.PervLogTerm, args.Entries = rf.getAppendLogs(peerIdx)
+	nextIdx := rf.nextIndex[peerIdx]
+	lastLogTerm, lastLogIndex := rf.lastLogTermIndex()
+	if nextIdx <= rf.lastSnapshotIndex || nextIdx > lastLogIndex {
+		// 没有需要发送的 log
+		args.PrevLogIndex = lastLogIndex
+		args.PrevLogTerm = lastLogTerm
+		return args
+	}
+
+	args.Entries = append([]LogEntry{}, rf.logEntries[rf.getRealIdxByLogIndex(nextIdx):]...)
+	args.PrevLogIndex = nextIdx - 1
+	if args.PrevLogIndex == rf.lastSnapshotIndex {
+		args.PrevLogTerm = rf.lastSnapshotTerm
+	} else {
+		args.PrevLogTerm = rf.getLogByIndex(args.PrevLogIndex).Term
+	}
 	return args
 }
 
@@ -151,15 +151,22 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 		rf.unlock("appendtopeer1")
 
 		RPCTimer.Stop()
-		RPCTimer.Reset(RPCTimeout)
+		RPCTimer.Reset(randRPCTimeout())
 		reply := AppendEntriesReply{}
 		resCh := make(chan bool, 1)
 
 		go func(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 			ok := rf.peers[peerIdx].Call("Raft.AppendEntries", args, reply)
 			//if no reply receive, wait
-			if !ok {
-				time.Sleep(RPCTimeout)
+		RPCSleepLoop:
+			for !ok {
+				select {
+				case <-RPCTimer.C:
+					rf.log("append to peer, rpctimeout: peer:%d, args:%+v", peerIdx, args)
+					break RPCSleepLoop
+				default:
+					time.Sleep(time.Millisecond * 30)
+				}
 			}
 			resCh <- ok
 		}(&args, &reply)
