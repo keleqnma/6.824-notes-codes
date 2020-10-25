@@ -47,7 +47,7 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term      int
-	Success   bool
-	NextIndex int
+	Term      int  // 当前服务器的term
+	Success   bool // 是否成功
+	NextIndex int  // 副本主动报告自己需要更新的log index， raft论文里说这种优化没必要，“在实践中，我们十分怀疑这种优化是否是必要的，因为失败是很少发生的并且也不大可能会有这么多不一致的日志。”，但是6.824的模拟环境里就是有这么多，所以需要实现这个优化。
 }

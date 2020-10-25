@@ -43,6 +43,9 @@ func (rf *Raft) RequestVote(req *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 	// 候选人最后一条日志的term小于当前服务器最后一条日志的term, 或者候选人最后一条日志的index小于当前服务器最后一条日志的index（即log记录冲突），拒绝投票
+	// 日志匹配特性：
+	// 如果在不同的日志中的两个条目拥有相同的索引和任期号，那么他们存储了相同的指令。
+	// 如果在不同的日志中的两个条目拥有相同的索引和任期号，那么他们之前的所有日志条目也全部相同。
 	if lastLogTerm > req.LastLogTerm || (req.LastLogTerm == lastLogTerm && req.LastLogIndex < lastLogIndex) {
 		return
 	}
@@ -171,7 +174,7 @@ func (rf *Raft) startElection() {
 	}
 
 	if rf.role == Leader {
-		rf.resetHeartBeatTimers()
+		rf.resetAllHeartBeatTimers()
 	}
 
 	rf.unlock("start_ele2")

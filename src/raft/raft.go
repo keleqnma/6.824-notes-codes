@@ -72,10 +72,12 @@ type Raft struct {
 	electionTimer       *time.Timer   // 发起选举的计时器
 	appendEntriesTimers []*time.Timer // appendEntries的计时器，2A中用来发心跳
 	applyTimer          *time.Timer   // apply日志的计时器，2A用不到
-	notifyApplyCh       chan struct{}
-	stopCh              chan struct{}
-	voteFor             int // 当前任期内收到选票的候选者id
-	applyCh             chan ApplyMsg
+
+	appendEnriesMu []sync.Mutex
+	notifyApplyCh  chan struct{}
+	stopCh         chan struct{}
+	voteFor        int // 当前任期内收到选票的候选者id
+	applyCh        chan ApplyMsg
 
 	logEntries  []LogEntry // 日志条目;每个条目包含了用于状态机的命令，以及领导者接收到该条目时的任期（第一个索引为1）,lastSnapshot 放到 index 0
 	commitIndex int        // 已知已提交的最高的日志条目的索引（初始值为0，单调递增）
@@ -89,7 +91,7 @@ type Raft struct {
 	lastSnapshotIndex int // 快照中的 index
 	lastSnapshotTerm  int
 
-	lockStart time.Time // debug 用，找出长时间 lock
+	lockStart time.Time
 	lockEnd   time.Time
 	lockName  string
 }
@@ -230,18 +232,20 @@ func (rf *Raft) startApplyLogs() {
 
 	rf.lock("applyLogs1")
 	var msgs []ApplyMsg
-	if rf.lastApplied < rf.lastSnapshotIndex {
+
+	switch {
+	// 直接把快照的apply
+	case rf.lastApplied < rf.lastSnapshotIndex:
 		msgs = make([]ApplyMsg, 0, 1)
 		msgs = append(msgs, ApplyMsg{
 			CommandValid: false,
 			Command:      "installSnapShot",
 			CommandIndex: rf.lastSnapshotIndex,
 		})
-
-	} else if rf.commitIndex <= rf.lastApplied {
+	case rf.commitIndex <= rf.lastApplied:
 		// snapShot 没有更新 commitidx
 		msgs = make([]ApplyMsg, 0)
-	} else {
+	default:
 		rf.log("rfapply")
 		msgs = make([]ApplyMsg, 0, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
@@ -308,7 +312,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.matchIndex[rf.me] = index
 		rf.persist()
 	}
-	rf.resetHeartBeatTimers()
+	rf.resetAllHeartBeatTimers()
 	rf.unlock("start")
 	return index, rf.currentTerm, isLeader
 }
@@ -374,24 +378,18 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 	rf.voteFor = voteForNobody
 	rf.role = Follower
 	rf.logEntries = make([]LogEntry, 1) // idx ==0 存放 lastSnapshot
+	rf.appendEnriesMu = make([]sync.Mutex, len(peers))
+	for i := range rf.appendEnriesMu {
+		rf.appendEnriesMu[i] = sync.Mutex{}
+	}
 	rf.readPersist(persister.ReadRaftState())
 
 	rf.log("raft server %d begin initialization", me)
 
-	// 发起投票
 	rf.electionTimer = time.NewTimer(randElectionTimeout())
-	go func() {
-		for {
-			select {
-			case <-rf.stopCh:
-				return
-			case <-rf.electionTimer.C:
-				rf.startElection()
-			}
-		}
-	}()
+	go rf.electionLoop()
 
-	// leader 发送日志
+	// leader 定期发送日志/心跳
 	rf.appendEntriesTimers = make([]*time.Timer, len(rf.peers))
 	for i := range rf.peers {
 		rf.appendEntriesTimers[i] = time.NewTimer(HeartBeatTimeout)
@@ -400,34 +398,49 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 		if i == rf.me {
 			continue
 		}
-		go func(index int) {
-			for {
-				select {
-				case <-rf.stopCh:
-					return
-				case <-rf.appendEntriesTimers[index].C:
-					rf.appendEntriesToPeer(index)
-				}
-			}
-		}(i)
+		go rf.appendEntriesLoop(i)
 	}
 
 	// apply log
 	rf.applyTimer = time.NewTimer(ApplyInterval)
 	rf.notifyApplyCh = make(chan struct{}, 100)
-	go func() {
-		for {
-			select {
-			case <-rf.stopCh:
-				return
-			case <-rf.applyTimer.C:
-				rf.notifyApplyCh <- struct{}{}
-			case <-rf.notifyApplyCh:
-				rf.startApplyLogs()
-			}
-		}
-	}()
+	go rf.applyLogLoop()
 
 	rf.readPersist(persister.ReadRaftState())
 	return rf
+}
+
+func (rf *Raft) electionLoop() {
+	for {
+		select {
+		case <-rf.stopCh:
+			return
+		case <-rf.electionTimer.C:
+			rf.startElection()
+		}
+	}
+}
+
+func (rf *Raft) appendEntriesLoop(index int) {
+	for {
+		select {
+		case <-rf.stopCh:
+			return
+		case <-rf.appendEntriesTimers[index].C:
+			rf.appendEntriesToPeer(index)
+		}
+	}
+}
+
+func (rf *Raft) applyLogLoop() {
+	for {
+		select {
+		case <-rf.stopCh:
+			return
+		case <-rf.applyTimer.C:
+			rf.notifyApplyCh <- struct{}{}
+		case <-rf.notifyApplyCh:
+			rf.startApplyLogs()
+		}
+	}
 }

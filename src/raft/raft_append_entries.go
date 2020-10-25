@@ -5,6 +5,11 @@ import (
 	"time"
 )
 
+const (
+	appendEntriesStageOne = "appendEnties:stage:sendRPC"
+	appendEntriesStageTwo = "appendEnties:stage:commit&snapshot"
+)
+
 func randRPCTimeout() time.Duration {
 	r := time.Duration(rand.Int63()) % RPCTimeout
 	return RPCTimeout + r
@@ -15,8 +20,8 @@ func (rf *Raft) getNextIndex() int {
 	return idx + 1
 }
 
+// 如果要添加的log比当前服务器存储log的index小，而且term还没有变化（leader没有变化），说明leader发送了不必要的appendEntries
 func (rf *Raft) outOfOrderAppendEntries(args *AppendEntriesArgs) bool {
-	// prevlog 已经对的上
 	argsLastIndex := args.PrevLogIndex + len(args.Entries)
 	lastTerm, lastIndex := rf.lastLogTermIndex()
 	if argsLastIndex < lastIndex && lastTerm == args.Term {
@@ -44,10 +49,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	_, lastLogIndex := rf.lastLogTermIndex()
 
 	switch {
-	case args.PrevLogIndex < rf.lastSnapshotIndex:
-		// 因为 lastsnapshotindex 应该已经被 apply，正常情况不该发生
-		reply.Success = false
-		reply.NextIndex = rf.lastSnapshotIndex + 1
 	case args.PrevLogIndex > lastLogIndex:
 		// 缺少中间的 log
 		reply.Success = false
@@ -83,6 +84,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for idx > rf.commitIndex && idx > rf.lastSnapshotIndex && rf.logEntries[rf.getRealIdxByLogIndex(idx)].Term == term {
 			idx -= 1
 		}
+		// 这里没有让leader采取回退政策，而是直接计算告诉leader下一次应该从哪里发送日志
 		reply.NextIndex = idx + 1
 	}
 
@@ -123,10 +125,9 @@ func (rf *Raft) getAppendEntriesArgs(peerIdx int) AppendEntriesArgs {
 	return args
 }
 
-func (rf *Raft) resetHeartBeatTimers() {
-	for i := range rf.appendEntriesTimers {
-		rf.appendEntriesTimers[i].Stop()
-		rf.appendEntriesTimers[i].Reset(0)
+func (rf *Raft) resetAllHeartBeatTimers() {
+	for peerIdx := range rf.appendEntriesTimers {
+		rf.resetHeartBeatTimer(peerIdx)
 	}
 }
 
@@ -136,19 +137,20 @@ func (rf *Raft) resetHeartBeatTimer(peerIdx int) {
 }
 
 func (rf *Raft) appendEntriesToPeer(peerIdx int) {
+	rf.appendEnriesMu[peerIdx].Lock()
 	RPCTimer := time.NewTimer(randRPCTimeout())
 	defer RPCTimer.Stop()
-
+	defer rf.appendEnriesMu[peerIdx].Unlock()
+RPCLoop:
 	for !rf.killed() {
+		rf.resetHeartBeatTimer(peerIdx)
 		if rf.role != Leader {
-			rf.resetHeartBeatTimer(peerIdx)
 			return
 		}
 
-		rf.lock("appendtopeer1")
+		rf.lock(appendEntriesStageOne)
 		args := rf.getAppendEntriesArgs(peerIdx)
-		rf.resetHeartBeatTimer(peerIdx)
-		rf.unlock("appendtopeer1")
+		rf.unlock(appendEntriesStageOne)
 
 		RPCTimer.Stop()
 		RPCTimer.Reset(randRPCTimeout())
@@ -157,14 +159,13 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 
 		go func(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 			ok := rf.peers[peerIdx].Call("Raft.AppendEntries", args, reply)
-			//if no reply receive, wait
 		RPCSleepLoop:
 			for !ok {
 				select {
 				case <-RPCTimer.C:
-					rf.log("append to peer, rpctimeout: peer:%d, args:%+v", peerIdx, args)
 					break RPCSleepLoop
 				default:
+					//if no reply receive, wait
 					time.Sleep(time.Millisecond * 30)
 				}
 			}
@@ -176,43 +177,47 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 			return
 		case <-RPCTimer.C:
 			rf.log("append to peer, rpctimeout: peer:%d, args:%+v", peerIdx, args)
-			continue
+			continue RPCLoop
 		case ok := <-resCh:
 			if !ok {
 				rf.log("append to peer no reply, peer:%d, args:%+v", peerIdx, args)
-				continue
+				continue RPCLoop
 			}
 		}
 
 		rf.log("append to perr, peer:%d, args:%+v, reply:%+v", peerIdx, args, reply)
 
-		rf.lock("appendtopeer2")
+		rf.lock(appendEntriesStageTwo)
 
+		// 失败情况 1. 目标节点的term比现在leader高（可能是因为网络隔离导致的）
 		if reply.Term > rf.currentTerm {
 			rf.changeRole(Follower)
 			rf.resetElectionTimer()
 			rf.currentTerm = reply.Term
 			rf.persist()
-			rf.unlock("appendtopeer2")
+			rf.unlock(appendEntriesStageTwo)
 			return
 		}
 
+		// 失败情况 2. 现在节点已不再是leader，或者节点term发生了变化
 		if rf.role != Leader || rf.currentTerm != args.Term {
-			rf.unlock("appendtopeer2")
+			rf.unlock(appendEntriesStageTwo)
 			return
 		}
 
 		if reply.Success {
+			// 同步一下已经复制的位置
 			if reply.NextIndex > rf.nextIndex[peerIdx] {
 				rf.nextIndex[peerIdx] = reply.NextIndex
 				rf.matchIndex[peerIdx] = reply.NextIndex - 1
 			}
+			// 同步log成功，更新一下
 			if len(args.Entries) > 0 && args.Entries[len(args.Entries)-1].Term == rf.currentTerm {
 				// 只 commit 自己 term 的 index
 				rf.updateCommitIndex()
 			}
 			rf.persist()
-			rf.unlock("appendtopeer2")
+			rf.unlock(appendEntriesStageTwo)
 			return
 		}
 
@@ -220,18 +225,16 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 		if reply.NextIndex != 0 {
 			if reply.NextIndex > rf.lastSnapshotIndex {
 				rf.nextIndex[peerIdx] = reply.NextIndex
-				rf.unlock("appendtopeer2")
-				continue
-				// need retry
+				rf.unlock(appendEntriesStageTwo)
+				continue RPCLoop
 			} else {
 				// send sn rpc
 				go rf.sendInstallSnapshot(peerIdx)
-				rf.unlock("appendtopeer2")
+				rf.unlock(appendEntriesStageTwo)
 				return
 			}
 		}
-		// 乱序？
-		rf.unlock("appendtopeer2")
+		rf.unlock(appendEntriesStageTwo)
 	}
 
 }
@@ -239,20 +242,21 @@ func (rf *Raft) appendEntriesToPeer(peerIdx int) {
 func (rf *Raft) updateCommitIndex() {
 	rf.log("in update commitindex")
 	hasCommit := false
-	for i := rf.commitIndex + 1; i <= rf.lastSnapshotIndex+len(rf.logEntries); i++ {
+	for logIndex := rf.commitIndex + 1; logIndex <= rf.lastSnapshotIndex+len(rf.logEntries); logIndex++ {
 		count := 0
 		for _, m := range rf.matchIndex {
-			if m >= i {
+			if m >= logIndex {
 				count += 1
+				// 一个log被超过半数的节点成功写入，则可以判断是成功写入了
 				if count > len(rf.peers)/2 {
-					rf.commitIndex = i
+					rf.commitIndex = logIndex
 					hasCommit = true
-					rf.log("update commit index:%d", i)
+					rf.log("update commit index:%d", logIndex)
 					break
 				}
 			}
 		}
-		if rf.commitIndex != i {
+		if rf.commitIndex != logIndex {
 			// 后续的不需要再判断
 			break
 		}
